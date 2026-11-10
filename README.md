@@ -32,7 +32,7 @@
 
 ## Overview
 
-When autonomous LLM agents (like Google Antigravity, Claude Engineer, or custom Gemini harnesses) work in large software repositories, their single biggest failure point is **context saturation**. Agents tend to explore blindly: running broad directory listings, recursive greps, and dumping entire 1,000-line source files into the context window just to inspect a 5-line helper function.
+When autonomous LLM agents work in large software repositories, their single biggest failure point is **context saturation**. Agents tend to explore blindly: running broad directory listings, recursive greps, and dumping entire 1,000-line source files into the context window just to inspect a 5-line helper function.
 
 **Graphify Context Guard** is an active, deterministic gatekeeper. Operating at the harness lifecycle level via Node.js hooks, it intercepts an agent's tool requests *before* execution. It prevents unconstrained exploration, forces the agent to consult pre-computed Abstract Syntax Tree (AST) knowledge graphs (via Graphify), clamps file reads to an 80-line maximum, and blocks greedy pagination loops.
 
