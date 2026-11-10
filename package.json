@@ -1,0 +1,23 @@
+{
+  "name": "graphify-context-guard",
+  "version": "1.0.0",
+  "description": "Deterministic lifecycle hooks enforcing Graphify-first AST exploration, 80-line read auto-clamping, sliding-window paging protection, and unscoped search prevention.",
+  "main": "scripts/context-guard.cjs",
+  "scripts": {
+    "test": "node --test tests/context-guard.test.cjs"
+  },
+  "keywords": [
+    "graphify",
+    "gemini",
+    "antigravity",
+    "ai-agents",
+    "context-guard",
+    "ast",
+    "llm-guardrails"
+  ],
+  "author": "Kemal Arda Aytac",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
