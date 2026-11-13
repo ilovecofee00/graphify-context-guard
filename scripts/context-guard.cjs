@@ -182,13 +182,144 @@ function limiterBound(toks) {
   }
   return Infinity;
 }
-// Scans every pipeline; returns {file, norm, start, end, bound} for the first source-file read, else null.
-function findShellReads(cmd) {
+// ---------------------------------------------- command structure (quote-aware)
+// Splits a command into segments (&&, ||, ;, newline) of pipeline stages (|), ignoring
+// separators inside quotes. $(...) and `...` bodies are scanned as extra segments.
+// Backslash escapes inside double quotes only for Bash (PowerShell paths end in "C:\dir\").
+function splitCommand(cmd, bashEscapes) {
+  const s = stripNoise(cmd);
+  const segs = [];
+  let stages = [];
+  let cur = "";
+  let q = null;
+  const endStage = () => {
+    stages.push(cur);
+    cur = "";
+  };
+  const endSeg = () => {
+    endStage();
+    segs.push(stages);
+    stages = [];
+  };
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) {
+      cur += ch;
+      if (bashEscapes && q === '"' && ch === "\\" && i + 1 < s.length) cur += s[++i];
+      else if (ch === q) q = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      q = ch;
+      cur += ch;
+    } else if ((ch === "&" || ch === "|") && s[i + 1] === ch) {
+      endSeg();
+      i++;
+    } else if (ch === ";" || ch === "\n" || ch === "\r") endSeg();
+    else if (ch === "|") endStage();
+    else cur += ch;
+  }
+  endSeg();
+  const subs = [];
+  for (const m of s.matchAll(/\$\(([^()]*)\)|`([^`]*)`/g)) {
+    if (m[1] !== undefined || bashEscapes) subs.push(...splitCommand(m[1] ?? m[2], bashEscapes));
+  }
+  return segs
+    .map((st) => st.map((x) => x.trim()).filter(Boolean))
+    .filter((st) => st.length)
+    .concat(subs);
+}
+// Command name (lowercased, path/.exe stripped) and its argument tokens for one stage.
+const PREFIXES = /^(?:sudo|&|\.|command|exec|time|nohup|xargs|env)$/i;
+function stageCommand(stage) {
+  const toks = tokenize(stage.replace(/^[({\s]+/, "").replace(/\[[^\]]*\]/g, " "));
+  while (toks.length && (/^\w+=/.test(toks[0]) || PREFIXES.test(toks[0]))) toks.shift();
+  const name = (toks[0] || "").replace(/\\/g, "/").split("/").pop().replace(/\.exe$/i, "").toLowerCase();
+  return { name, args: toks.slice(1) };
+}
+
+const LISTERS = new Set(["ls", "dir", "find", "tree", "gci", "get-childitem", "fd"]);
+const SEARCHERS = new Set(["grep", "egrep", "fgrep", "rg", "ripgrep", "findstr", "select-string", "sls"]);
+const GIT_DISCOVERY = new Set(["ls-files", "ls-tree", "grep"]);
+// Flags whose value is the next token (grep + rg); their value is never a path.
+const VALUE_FLAGS = new Set([
+  "-e", "-f", "-A", "-B", "-C", "-m", "-d", "-D", "--include", "--exclude", "--exclude-dir",
+  "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not", "-M", "--max-depth", "-j", "-r", "--replace",
+  "--regexp", "--file",
+]);
+
+function isGraphifyLookup({ name, args }) {
+  let rest = null;
+  if (name === "graphify") rest = args;
+  else if (/^(?:python3?|py)$/.test(name) && args[0] === "-m" && args[1] === "graphify") rest = args.slice(2);
+  else if (name === "uvx" && args[0] === "graphify") rest = args.slice(1);
+  return !!rest && /^(?:query|explain|path)$/i.test(rest[0] || "");
+}
+function isDiscoveryStage({ name, args }, stageIndex) {
+  if (LISTERS.has(name)) return true;
+  if (name === "git") return GIT_DISCOVERY.has((args[0] || "").toLowerCase());
+  // a search tool fed by a pipe filters output; only a first-stage search scans files
+  return SEARCHERS.has(name) && stageIndex === 0;
+}
+// Positional path arguments of a search/list command (patterns and flag values excluded).
+function pathArgs({ name, args }) {
+  if (name === "select-string" || name === "sls") {
+    const paths = [];
+    const pos = [];
+    let namedPattern = false;
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i].toLowerCase();
+      if (a === "-path" || a === "-literalpath") paths.push(...String(args[++i] || "").split(","));
+      else if (a === "-pattern") (namedPattern = true), i++;
+      else if (/^-(?:include|exclude|encoding|context)$/.test(a)) i++;
+      else if (!a.startsWith("-")) pos.push(args[i]);
+    }
+    return paths.concat(namedPattern ? pos : pos.slice(1));
+  }
+  if (name === "findstr") {
+    const pos = args.filter((a) => !/^\/[a-z]/i.test(a));
+    const explicit = args.some((a) => /^\/[cg]:/i.test(a));
+    return explicit ? pos : pos.slice(1);
+  }
+  const pos = [];
+  let explicitPattern = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (VALUE_FLAGS.has(a)) {
+      if (a === "-e" || a === "-f" || a === "--regexp" || a === "--file") explicitPattern = true;
+      i++;
+    } else if (/^(?:-e|-f|--regexp=|--file=)./.test(a)) explicitPattern = true;
+    else if (!a.startsWith("-")) pos.push(a);
+  }
+  return SEARCHERS.has(name) && !explicitPattern ? pos.slice(1) : pos;
+}
+// True when a path is root node_modules or a wildcard across all packages.
+function isRootNodeModules(p) {
+  const n = String(p).replace(/\\/g, "/");
+  const m = /(?:^|\/)node_modules(?:\/(.*))?$/.exec(n);
+  if (!m) return false;
+  const next = (m[1] || "").split("/")[0];
+  return next === "" || /[*?]/.test(next);
+}
+// Search over root node_modules: a search tool given it as a path, or a lister of it
+// whose output feeds a search (gci node_modules | sls, find node_modules -exec grep).
+function searchesRootNodeModules(stages) {
+  const cmds = stages.map(stageCommand);
+  const hasSearch = cmds.some((c) => SEARCHERS.has(c.name));
+  return cmds.some((c) => {
+    if (SEARCHERS.has(c.name)) return pathArgs(c).some(isRootNodeModules);
+    if (LISTERS.has(c.name)) {
+      const listsRoot = c.args.filter((a) => !a.startsWith("-")).some(isRootNodeModules);
+      return listsRoot && (hasSearch || c.args.some((a) => SEARCHERS.has(a.toLowerCase())));
+    }
+    return false;
+  });
+}
+
+// Scans every pipeline; returns {file, norm, start, end, bound} for each source-file read.
+function findShellReads(segments) {
   const hits = [];
-  const cleaned = stripNoise(cmd);
-  for (const seg of cleaned.split(/&&|\|\||;|\r?\n/)) {
-    const stages = seg.split("|").map((s) => s.trim()).filter(Boolean);
-    if (!stages.length) continue;
+  for (const stages of segments) {
     const raw = stages[0];
     const toks = tokenize(raw.replace(/[()]/g, " ").replace(/\[[^\]]*\]/g, " ")).filter((t) => !/^(?:sudo|&)$/.test(t));
     while (toks.length && /^\w+=/.test(toks[0])) toks.shift(); // env assignments
@@ -236,22 +367,31 @@ function preTool() {
   // Shell tools
   if (tool === "Bash" || tool === "PowerShell") {
     const cmd = String(input.command || "");
-    const isGraphifyLookup = /\bgraphify\b[\s\S]*?\b(?:query|explain|path)\b/i.test(cmd);
-    if (isGraphifyLookup) {
+    const segments = splitCommand(cmd, tool === "Bash");
+    let open = unlocked;
+
+    // A graphify lookup anywhere in the command unlocks the session (it runs before later steps)
+    if (segments.some((st) => st.some((s) => isGraphifyLookup(stageCommand(s))))) {
       unlock();
-      pass();
+      open = true;
     }
 
-    if (hasGraph && !unlocked) {
-      const isDiscovery =
-        /\b(?:get-childitem|gci|dir|ls|find|tree|grep|rg|ripgrep|select-string|findstr)\b/i.test(cmd);
+    // Search over root node_modules (all projects): judged by real command names and path args
+    if (!/--force-vendor/i.test(cmd) && segments.some(searchesRootNodeModules)) {
+      deny(
+        "[graphify-guard] Unscoped search in root node_modules is prohibited. Target node_modules/<pkg>/... or pass --force-vendor."
+      );
+    }
+
+    if (hasGraph && !open) {
+      const isDiscovery = segments.some((st) => st.some((s, i) => isDiscoveryStage(stageCommand(s), i)));
       if (isDiscovery) deny(BLOCK_MSG);
     }
 
     // Shell file reads of source files: same rules as Read (lock, 300-line window, paging ban)
     if (hasGraph) {
-      for (const h of findShellReads(cmd)) {
-        if (!unlocked) deny(BLOCK_MSG);
+      for (const h of findShellReads(segments)) {
+        if (!open) deny(BLOCK_MSG);
         if (h.bound > MAX_WINDOW_LINES) {
           deny(
             `[graphify-guard] Shell read of '${h.file}' would print ${h.bound === Infinity ? "the whole file" : h.bound + " lines"}. ` +
@@ -263,16 +403,6 @@ function preTool() {
           if (count > MAX_CONSECUTIVE_PAGES) deny(pagingMsg(h.norm, count));
         }
       }
-    }
-
-    const isSearch =
-      /\b(?:grep|rg|ripgrep|findstr)\b/i.test(cmd) && !/\bgit\s+grep\b/i.test(cmd) ||
-      (/\bselect-string\b/i.test(cmd) && /(-path\b|\bget-childitem\b)/i.test(cmd));
-    const unscopedNodeModules = /(?:^|[\s"'/\\])node_modules(?:[\/\\]?\s*$|[\/\\]?\s+|[\/\\]?\*+|["'])/i.test(cmd);
-    if (isSearch && unscopedNodeModules && !/--force-vendor/i.test(cmd)) {
-      deny(
-        "[graphify-guard] Unscoped search in root node_modules is prohibited. Target node_modules/<pkg>/... or pass --force-vendor."
-      );
     }
     pass();
   }

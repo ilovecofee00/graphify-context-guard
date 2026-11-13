@@ -3,7 +3,7 @@
 Enforced by `graphify-guard` hooks. All rules apply only in workspaces containing `graphify-out/`.
 
 ## 1. Discovery protocol
-- **AST first**: `Glob`, `Grep`, shell listings/searches (`ls`, `find`, `grep`, `rg`, `Get-ChildItem`, `Select-String`...) and reads of files under `src/ lib/ app/ tools/ public/` are blocked until a graphify lookup has run in this session (unlock lasts 30 min).
+- **AST first**: `Glob`, `Grep`, shell listings/searches (`ls`, `find`, `grep`, `rg`, `Get-ChildItem`, `Select-String`, `git ls-files`, `git grep`...; a search fed by a pipe, like `npm test | grep fail`, is fine) and reads of files under `src/ lib/ app/ tools/ public/` are blocked until a graphify lookup has run in this session (unlock lasts 30 min).
   Always allowed: `README.md`, `ROADMAP.md`, `CLAUDE.md`, `AGENTS.md`, `package.json`, `tsconfig*.json`.
 - **Granular queries**: 1-2 concepts per query, always `--budget 800`.
   - Concept / symbol: `graphify explain "<concept>"`

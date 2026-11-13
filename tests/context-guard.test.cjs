@@ -255,6 +255,90 @@ describe("graphify-guard context-guard.cjs (Claude Code hook protocol)", () => {
     });
   });
 
+  // ------------------------------------------- Command-structure parsing (v1.0.0)
+  describe("No false positives from words inside strings or arguments", () => {
+    test("node_modules mentioned in a string next to an output filter is allowed", () => {
+      unlock();
+      assertPass(
+        tool("Bash", {
+          command:
+            `sed -i 's/"description": ".*"/"description": "unscoped node_modules search prevention."/' plugin.json && npm test 2>&1 | grep -E "^(tests|pass|fail)"`,
+        })
+      );
+      assertPass(tool("Bash", { command: `git commit -m "block grep over node_modules"` }));
+    });
+
+    test("grep for the word node_modules in a file is not a node_modules search", () => {
+      unlock();
+      assertPass(tool("Bash", { command: "grep -n node_modules .gitignore" }));
+      assertPass(tool("Bash", { command: "rg --exclude-dir node_modules foo src" }));
+      assertPass(tool("Bash", { command: "grep -rn --exclude-dir=node_modules foo ." }));
+    });
+
+    test("discovery words inside strings or paths do not block a locked session", () => {
+      assertPass(tool("Bash", { command: `git commit -m "fix tree view and find bug"` }));
+      assertPass(tool("Bash", { command: `echo "ls the dir"` }));
+      assertPass(tool("Bash", { command: "cat build/dir/out.log" }));
+      assertPass(tool("PowerShell", { command: `Write-Output "C:\\tools\\dir\\"; git status` }));
+    });
+
+    test("a search tool fed by a pipe is an output filter, not discovery", () => {
+      assertPass(tool("Bash", { command: "npm test 2>&1 | grep fail" }));
+      assertPass(tool("PowerShell", { command: "npm test | Select-String fail" }));
+    });
+
+    test("graphify subcommand words elsewhere do not unlock", () => {
+      assertPass(tool("Bash", { command: "graphify update . && echo path" }));
+      assert.equal(fs.existsSync(lockFile), false);
+      assertDeny(tool("Grep", { pattern: "x" }));
+    });
+  });
+
+  describe("Real discovery and vendor searches are still caught", () => {
+    test("discovery after && / ; / subshell is blocked when locked", () => {
+      assertDeny(tool("Bash", { command: "npm test && ls src" }));
+      assertDeny(tool("Bash", { command: "echo hi; find . -name '*.ts'" }));
+      assertDeny(tool("Bash", { command: "echo $(ls src)" }));
+      assertDeny(tool("Bash", { command: "FOO=1 sudo rg useEffect" }));
+    });
+
+    test("git ls-files, git ls-tree and git grep count as discovery", () => {
+      assertDeny(tool("Bash", { command: "git ls-files" }));
+      assertDeny(tool("Bash", { command: "git ls-tree -r HEAD" }));
+      assertDeny(tool("Bash", { command: "git grep useEffect" }));
+      assertPass(tool("Bash", { command: "git log --oneline -5" }));
+    });
+
+    test("a lookup earlier in the same command unlocks the rest", () => {
+      assertPass(tool("Bash", { command: 'graphify explain "Router" && ls src' }));
+      assertPass(tool("Bash", { command: 'python -m graphify query "auth" --budget 800' }));
+    });
+
+    test("node_modules searches in all forms", () => {
+      unlock();
+      for (const [t, command] of [
+        ["Bash", "grep -rn foo ./node_modules"],
+        ["Bash", 'rg -e foo "node_modules/"'],
+        ["Bash", "grep -rn foo node_modules/*"],
+        ["Bash", "find node_modules -name '*.js' | xargs grep foo"],
+        ["Bash", "find node_modules -name '*.js' -exec grep -l foo {} +"],
+        ["PowerShell", "Get-ChildItem node_modules -Recurse | Select-String foo"],
+        ["PowerShell", "Select-String -Pattern foo -Path node_modules\\*"],
+        ["PowerShell", "findstr /s foo node_modules\\*"],
+      ]) {
+        assertDeny(tool(t, { command }), "node_modules");
+      }
+      assertPass(tool("Bash", { command: "grep -rn foo node_modules/three/src" }));
+      assertPass(tool("Bash", { command: "find node_modules -maxdepth 1" }));
+    });
+
+    test("quoted separators do not hide or split commands", () => {
+      unlock();
+      assertPass(tool("Bash", { command: `echo "a | grep b; ls" > out.txt` }));
+      assertDeny(tool("Bash", { command: `echo "x;y" && cat src/index.ts` }), "the whole file");
+    });
+  });
+
   // ------------------------------------------------------- Non-graph projects
   describe("Workspaces without graphify-out/", () => {
     beforeEach(() => fs.rmSync(path.join(ws, "graphify-out"), { recursive: true }));

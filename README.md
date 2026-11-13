@@ -27,11 +27,11 @@ Every read/exploration rule applies **only in workspaces that contain `graphify-
 
 | # | Rule | Trigger | Result |
 |---|---|---|---|
-| 1 | **Graphify first** | `Grep`, `Glob`, shell discovery (`ls`, `find`, `tree`, `grep`, `rg`, `Get-ChildItem`, `Select-String`, `findstr`, `dir`), or reading files under `src/ lib/ app/ tools/ public/` before any `graphify query / explain / path` in this session | Denied, with a one-line instruction to run a graphify lookup. The unlock lasts 30 min per session. |
+| 1 | **Graphify first** | `Grep`, `Glob`, a shell step whose command is a lister (`ls`, `dir`, `find`, `fd`, `tree`, `Get-ChildItem`), `git ls-files / ls-tree / grep`, a file search (`grep`, `rg`, `Select-String`, `findstr`) as the first stage of a pipeline, or reading files under `src/ lib/ app/ tools/ public/`, all before any `graphify query / explain / path` in this session | Denied, with a one-line instruction to run a graphify lookup. The unlock lasts 30 min per session. A search fed by a pipe (`npm test \| grep fail`) is an output filter and is allowed. |
 | 2 | **300-line read window** | `Read` with no `limit` or `limit > 300` | Input rewritten to `limit: 300` (offset kept). The call goes ahead. |
 | 2b | Shell read sizing | `cat`, `Get-Content`, `head`, `tail`, `sed -n`, `bat`, `nl`, `more`, `less` on a source file that would print > 300 lines (pipe limiters like `\| head -n 40`, `\| wc -l` are taken into account) | Denied |
 | 3 | **Sequential paging ban** | A 3rd back-to-back chunk of the same file (each chunk starts within ±5 lines of where the last one ended, within 5 min). `Read` and ranged shell reads share the counter. | Denied, pointing to `graphify explain` (`loc=Lxx`) |
-| 4 | **Vendor noise** | `grep` / `rg` / `findstr` / `Select-String` over root `node_modules` (applies in all projects) | Denied unless scoped to `node_modules/<pkg>/…` or `--force-vendor` is passed |
+| 4 | **Vendor noise** | A search tool given root `node_modules` (or `node_modules/*`) as a path, or a lister of it that feeds a search (`gci node_modules \| sls`, `find node_modules -exec grep`). Applies in all projects. | Denied unless scoped to `node_modules/<pkg>/…` or `--force-vendor` is passed |
 
 Always readable: `README.md`, `ROADMAP.md`, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `package.json`, `tsconfig*.json`, images, PDFs and notebooks. Images, PDFs and notebooks are never clamped.
 
@@ -182,7 +182,7 @@ The SessionStart hook already tells Claude the rules. If you also want them in y
 ## Limitations
 
 - **Pattern-based, not a sandbox.** Commands are matched with regexes. An agent can get around the guard on purpose (for example `python -c "print(open(...).read())"` or `awk`). The goal is to steer the default behavior, not to enforce security.
-- **False positives:** discovery words are matched anywhere in a locked command, so commands like `git ls-files` are also blocked until the first graphify lookup. The `node_modules` rule also scans the whole command text: a command that runs `grep` and only *mentions* `node_modules` in a string (for example in a commit message or a JSON value) is denied. Split the command or add `--force-vendor`.
+- **How shell commands are judged:** the guard splits a command at `&&`, `||`, `;`, `|` and newlines (respecting quotes, and also looking inside `$(...)`), then looks at each step's *command name* and *path arguments*. Words inside strings, commit messages or file paths don't trigger it. It's still a heuristic, not a shell parser: unusual syntax (PowerShell backtick escapes, `eval`, aliases you defined yourself) may be judged wrongly in either direction.
 - **Fixed source folders:** "source" means a path containing `src/`, `lib/`, `app/`, `tools/` or `public/`. Files elsewhere aren't gated, only clamped.
 - **Auto-approval:** a clamped `Read` returns `"allow"`, which skips the permission prompt for that Read. Your deny rules are still evaluated. Read is a read-only tool.
 - **Tested on Windows 11 only.** The script has no platform-specific code, but it hasn't been run on macOS or Linux.
@@ -197,7 +197,7 @@ The tests use Node's built-in test runner and have zero dependencies. They spawn
 npm test
 ```
 
-27 tests in 9 groups: SessionStart (graph / no graph), the Graphify-first gate (Grep, Glob, shell discovery, source vs. doc vs. binary reads), unlocking (query/explain/path, session scoping, 30-min expiry), the Read clamp, the paging ban (per file, reset on jumps, shared with `sed -n`), shell read sizing (whole-file dumps, > 300 lines, pipe limiters, `sed -i` ignored), `node_modules` scoping, non-graph projects, and invalid input.
+37 tests in 11 groups: SessionStart (graph / no graph), the Graphify-first gate (Grep, Glob, shell discovery, source vs. doc vs. binary reads), unlocking (query/explain/path, session scoping, 30-min expiry), the Read clamp, the paging ban (per file, reset on jumps, shared with `sed -n`), shell read sizing (whole-file dumps, > 300 lines, pipe limiters, `sed -i` ignored), `node_modules` scoping, non-graph projects, invalid input, and false-positive regressions (keywords inside strings, commit messages and paths; pipe filters; quoted separators), alongside checks that real discovery and vendor searches are still caught.
 
 ---
 
