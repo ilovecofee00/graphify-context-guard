@@ -2,7 +2,7 @@
 
 > **A Claude Code plugin that makes Claude query a [Graphify](https://github.com/safishamsi/graphify) knowledge graph before it explores a codebase, caps file reads at 300 lines and blocks page-by-page dumps of whole files. It does this with two small hooks that stay out of the model's way.**
 
-**Claude Code native from v1.0.0.** The earliest version of this repo targeted Gemini / Antigravity harnesses (`PreInvocation`, `read_file`, `run_command`). That version is gone. v1.0.0 uses Claude Code's plugin format, Claude Code's hook protocol and Claude Code's tool names (`Read`, `Grep`, `Glob`, `Bash`, `PowerShell`), and it won't work in other harnesses as-is. The old version is still in git history (`ddf3f1d`) if you need it.
+**Claude Code native from v1.0.0.** The earliest version of this repo targeted Gemini / Antigravity harnesses (`PreInvocation`, `read_file`, `run_command`). That version is gone. v1.0.0 uses Claude Code's plugin format, Claude Code's hook protocol and Claude Code's tool names (`Read`, `Grep`, `Glob`, `Bash`, `PowerShell`), and it won't work in other harnesses as-is. The old version is still in git history (`ddf3f1d`) if you need it. That version is pretty much premature but not completely useless. You can make it work way better trough trial and error.**
 
 ---
 
