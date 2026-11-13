@@ -1,0 +1,6 @@
+{
+  "name": "graphify-guard",
+  "version": "1.0.0",
+  "description": "Claude Code plugin: Graphify-first exploration gate, 300-line Read clamp, sequential-paging ban and unscoped node_modules search prevention.",
+  "author": { "name": "Kemal Arda Aytaç" }
+}

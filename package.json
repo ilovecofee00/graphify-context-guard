@@ -1,18 +1,18 @@
 {
   "name": "graphify-context-guard",
   "version": "1.0.0",
-  "description": "Deterministic lifecycle hooks enforcing Graphify-first AST exploration, 80-line read auto-clamping, sliding-window paging protection, and unscoped search prevention.",
+  "description": "Claude Code plugin hooks enforcing Graphify-first exploration, a 300-line Read clamp, sequential-paging protection and unscoped node_modules search prevention.",
   "main": "scripts/context-guard.cjs",
   "scripts": {
     "test": "node --test tests/context-guard.test.cjs"
   },
   "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "claude-code-hooks",
     "graphify",
-    "gemini",
-    "antigravity",
+    "context-window",
     "ai-agents",
-    "context-guard",
-    "ast",
     "llm-guardrails"
   ],
   "author": "Kemal Arda Aytac",

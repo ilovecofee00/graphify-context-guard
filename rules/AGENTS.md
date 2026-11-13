@@ -1,24 +1,20 @@
-# Global Graphify State-Machine & Codebase Exploration Guardrails
+# Graphify State-Machine & Exploration Guardrails (Claude Code)
 
-Mandatory state-machine exploration rules enforced across all workspaces via `context-guard`:
+Enforced by `graphify-guard` hooks. All rules apply only in workspaces containing `graphify-out/`.
 
-## 1. State-Machine Discovery Protocol
-- **Assume Graphify Present**: Assume `graphify-out/graph.json` is present by default. NEVER execute `Test-Path graphify-out` or conditional existence checks. Fall back only if the Python module explicitly reports a missing graph.
-- **Turn-1 Gatekeeper**: Batching directory scans (`Get-ChildItem`, `dir`, `ls`, `tree`, `find`) or raw file searches (`grep`, `rg`, `Select-String`) before running Graphify on Turn 1 is strictly forbidden and blocked by middleware hooks. Reading top-level specification files (`ROADMAP.md`, `README.md`, `package.json`) is the only exception.
-- **Granular Querying (1-2 Concepts Max)**: Multi-concept "bag-of-words" queries are strictly forbidden. Target 1-2 architectural symbols or concepts per query. Always include `--budget 800` (or `--context call`) to prevent hub-node token bloat. If results are truncated, narrow with `context_filter` or `get_node`.
-- **AST Lookup & Inspection**:
-  - Concept / File / Symbol lookup:
-    - Windows: `.\.venv\Scripts\python.exe -m graphify explain "<concept>"`
-    - POSIX: `./.venv/bin/python -m graphify explain "<concept>"`
-  - Component relationships: `python -m graphify path "<A>" "<B>"`
-  - Focused semantic queries: `python -m graphify query "<focused_query>" --budget 800`
-  - Windows Terminal Sandbox: Always invoke `.venv` Python / Graphify commands with `BypassSandbox: true` to prevent virtualenv socket hangs.
+## 1. Discovery protocol
+- **AST first**: `Glob`, `Grep`, shell listings/searches (`ls`, `find`, `grep`, `rg`, `Get-ChildItem`, `Select-String`...) and reads of files under `src/ lib/ app/ tools/ public/` are blocked until a graphify lookup has run in this session (unlock lasts 30 min).
+  Always allowed: `README.md`, `ROADMAP.md`, `CLAUDE.md`, `AGENTS.md`, `package.json`, `tsconfig*.json`.
+- **Granular queries**: 1-2 concepts per query, always `--budget 800`.
+  - Concept / symbol: `graphify explain "<concept>"`
+  - Relationship: `graphify path "<A>" "<B>"`
+  - Focused search: `graphify query "<focused query>" --budget 800`
+  Use the `graphify` CLI on PATH (uv tool install); `python -m graphify` fails with system Python.
 
-## 2. Targeted Read & Search Rules
-- **AST-First Reads**: Read source files only after target symbols and exact line offsets (`loc=Lxx`) are identified through AST graph lookup.
-- **Strict Window Clamping**: Direct `read_file` calls are strictly capped and auto-clamped at **80 lines** per request.
-- **Sequential Paging Ban**: Reading a file in consecutive sliding chunks (e.g., lines 1–80, 81–160, 161–240) is blocked after **2 consecutive pages**. Locate exact symbols via Graphify instead of paging through files.
-- **Vendor & Root Search Protection**: Specific package subdirectories (e.g., `node_modules/<pkg>/...`) are permitted. Unconstrained root `node_modules` dumps are blocked unless `--force-vendor` is explicitly passed.
+## 2. Read rules
+- `Read` is clamped to **300 lines** per call (images/PDF/notebooks exempt).
+- More than **2 consecutive chunk reads** (≈600 contiguous lines) of one file within 5 min is blocked: locate symbols via graphify (`loc=Lxx`) and read ~50 lines around them.
+- Unscoped searches over root `node_modules` are blocked; target `node_modules/<pkg>/...` or pass `--force-vendor`.
 
-## 3. Milestone Synchronization
-- Synchronize the knowledge graph once at the completion of a milestone or feature via `python -m graphify update .` to avoid intermediate edit noise.
+## 3. Milestone sync
+- Run `graphify update .` once at the end of a milestone/feature, not after every edit.

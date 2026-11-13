@@ -1,50 +1,52 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
+// graphify-guard v1.0.0 — Claude Code native
+// Hook protocol: stdin JSON {session_id, cwd, hook_event_name, tool_name, tool_input}
+//   pass-through  -> exit 0, no stdout (normal permission flow continues)
+//   deny          -> exit 0, hookSpecificOutput.permissionDecision = "deny"
+//   rewrite input -> exit 0, permissionDecision "allow" + updatedInput (Read only: read-only tool)
+// All read/exploration rules apply ONLY in workspaces that contain graphify-out/.
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 
-const LOCK_TTL_MS = 30 * 60 * 1000; // 30 minutes session AST lock
-const PAGING_TTL_MS = 5 * 60 * 1000; // 5 minutes sliding-window reset TTL
+const LOCK_TTL_MS = 30 * 60 * 1000; // graphify "unlock" lasts 30 min per session
+const PAGING_TTL_MS = 5 * 60 * 1000; // sliding-window tracker resets after 5 min idle
+const MAX_WINDOW_LINES = 300; // max lines per Read in graph projects
+const MAX_CONSECUTIVE_PAGES = 2; // 2 x 300 = 600 contiguous lines, then use graphify
 
-const MAX_WINDOW_LINES = 80; // Maximum lines allowed per single read
-const MAX_CONSECUTIVE_PAGES = 2; // Maximum consecutive sequential reads on the same file
+const BLOCK_MSG =
+  "[graphify-guard] This workspace has graphify-out/. Run a focused `graphify query \"<1-2 concepts>\" --budget 800`, " +
+  "`graphify explain \"<symbol>\"` or `graphify path \"<A>\" \"<B>\"` FIRST, then explore/read with the returned locations.";
 
-if (process.argv.includes("pre-invocation")) {
-  runPreInvocation();
-} else {
-  runPreTool();
-}
+const mode = process.argv.includes("session-start") ? "session-start" : "pre-tool";
+const payload = readPayload();
+const workspaceRoot = payload.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+const sessionId = String(payload.session_id || "nosession");
+const hasGraph = fs.existsSync(path.join(workspaceRoot, "graphify-out"));
 
-function getWorkspaceRoot(payload) {
-  if (Array.isArray(payload?.workspacePaths) && payload.workspacePaths.length > 0) {
-    return payload.workspacePaths[0];
-  }
-  return process.env.WORKSPACE_ROOT || process.cwd();
-}
 
-function getWorkspaceHash(workspaceRoot) {
-  const normalized = path.resolve(workspaceRoot).replace(/\\/g, "/").toLowerCase();
-  return crypto.createHash("md5").update(normalized).digest("hex").slice(0, 12);
-}
-
-function getLockPath(workspaceRoot) {
-  const hash = getWorkspaceHash(workspaceRoot);
-  return path.join(os.tmpdir(), `.graphify-session-${hash}.lock`);
-}
-
-function getTrackerPath(workspaceRoot) {
-  const hash = getWorkspaceHash(workspaceRoot);
-  return path.join(os.tmpdir(), `.guard-read-tracker-${hash}.json`);
-}
-
-function isSessionQueried(workspaceRoot) {
-  const lp = getLockPath(workspaceRoot);
-  if (!fs.existsSync(lp)) return false;
+// ------------------------------------------------------------------ helpers
+function readPayload() {
   try {
-    const stat = fs.statSync(lp);
-    if (Date.now() - stat.mtimeMs > LOCK_TTL_MS) {
-      fs.unlinkSync(lp);
+    const raw = fs.readFileSync(0, "utf-8");
+    return raw.trim() ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+function key() {
+  const norm = path.resolve(workspaceRoot).replace(/\\/g, "/").toLowerCase();
+  return crypto.createHash("md5").update(norm + "|" + sessionId).digest("hex").slice(0, 12);
+}
+const lockPath = () => path.join(os.tmpdir(), `.graphify-guard-${key()}.lock`);
+const trackerPath = () => path.join(os.tmpdir(), `.graphify-guard-reads-${key()}.json`);
+
+function isUnlocked() {
+  try {
+    const st = fs.statSync(lockPath());
+    if (Date.now() - st.mtimeMs > LOCK_TTL_MS) {
+      fs.unlinkSync(lockPath());
       return false;
     }
     return true;
@@ -52,283 +54,275 @@ function isSessionQueried(workspaceRoot) {
     return false;
   }
 }
-
-function markSessionQueried(workspaceRoot) {
+function unlock() {
   try {
-    fs.writeFileSync(getLockPath(workspaceRoot), new Date().toISOString(), "utf-8");
+    fs.writeFileSync(lockPath(), new Date().toISOString(), "utf-8");
   } catch {}
 }
-
-function getReadHistory(workspaceRoot) {
-  const tp = getTrackerPath(workspaceRoot);
-  if (!fs.existsSync(tp)) return {};
+function loadHistory() {
   try {
-    return JSON.parse(fs.readFileSync(tp, "utf-8"));
+    return JSON.parse(fs.readFileSync(trackerPath(), "utf-8"));
   } catch {
     return {};
   }
 }
-
-function saveReadHistory(workspaceRoot, history) {
+function saveHistory(h) {
   try {
-    fs.writeFileSync(getTrackerPath(workspaceRoot), JSON.stringify(history), "utf-8");
+    fs.writeFileSync(trackerPath(), JSON.stringify(h), "utf-8");
   } catch {}
 }
-
-// -------------------------------------------------------------
-// PreInvocation Handler
-// -------------------------------------------------------------
-function runPreInvocation() {
-  let raw = "";
-  try {
-    raw = fs.readFileSync(0, "utf-8");
-  } catch {
-    raw = "";
-  }
-
-  let payload = {};
-  if (raw.trim()) {
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      payload = {};
-    }
-  }
-
-  const workspaceRoot = getWorkspaceRoot(payload);
-  const queried = isSessionQueried(workspaceRoot);
-
-  const response = {
-    injectSteps: [
-      {
-        ephemeralMessage:
-          `Context Guard Active (Session AST Unlocked: ${queried}):\n` +
-          `1. Targeted Reads: Max read slice is strictly ${MAX_WINDOW_LINES} lines. Broad dumps are auto-clamped.\n` +
-          `2. Sequential Paging Ban: Sliding window reads (e.g. 1-80, 81-160...) on the same file are rejected after ${MAX_CONSECUTIVE_PAGES} consecutive pages. Use Graphify symbol offsets (loc=Lxx).\n` +
-          `3. State 1 (AST First): Unverified exploration commands remain blocked until 'graphify query', 'explain', or 'path' is executed.`,
-      },
-    ],
-    terminationBehavior: "",
-  };
-  process.stdout.write(JSON.stringify(response));
+function pass() {
   process.exit(0);
 }
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj));
+  process.exit(0);
+}
+function deny(reason) {
+  emit({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason,
+    },
+  });
+}
 
-// -------------------------------------------------------------
-// PreToolUse Handler
-// -------------------------------------------------------------
-function runPreTool() {
-  let raw = "";
-  try {
-    raw = fs.readFileSync(0, "utf-8");
-  } catch {
-    raw = "";
+function normPath(p) {
+  const abs = path.isAbsolute(p) ? p : path.resolve(workspaceRoot, p);
+  return abs.replace(/\\/g, "/").toLowerCase();
+}
+const SOURCE_DIR_RE = /(?:^|\/)(?:src|lib|app|tools|public)\//;
+const DOC_RE = /(?:roadmap\.md|readme\.md|claude\.md|agents\.md|gemini\.md|package\.json|tsconfig[^/]*\.json)$/i;
+
+// Sliding-window tracker shared by Read and ranged shell reads. Returns consecutive chunk count.
+function trackPaging(norm, start, end) {
+  const history = loadHistory();
+  const now = Date.now();
+  const rec = history[norm] || { count: 0, lastEnd: 0, ts: 0 };
+  const sequential = now - rec.ts < PAGING_TTL_MS && Math.abs(start - (rec.lastEnd + 1)) <= 5;
+  rec.count = sequential ? rec.count + 1 : 1;
+  rec.lastEnd = end;
+  rec.ts = now;
+  history[norm] = rec;
+  saveHistory(history);
+  return rec.count;
+}
+function pagingMsg(norm, count) {
+  return (
+    `[graphify-guard] Sequential paging on '${path.basename(norm)}' (${count} consecutive chunks). ` +
+    "Locate the symbol with `graphify explain \"<symbol>\"` (loc=Lxx) and read ~50 lines around it."
+  );
+}
+
+// ------------------------------------------------- shell file-read detection
+const READERS = new Set(["cat", "type", "gc", "get-content", "more", "less", "bat", "nl", "head", "tail", "sed"]);
+const FILTERS = new Set(["wc", "measure-object", "grep", "rg", "findstr", "select-string", "sls"]);
+
+function stripNoise(cmd) {
+  return cmd
+    .replace(/@(['"])[\s\S]*?\r?\n\1@/g, " ") // PowerShell here-strings
+    .replace(/<<-?\s*(['"]?)(\w+)\1([^\n]*)\n[\s\S]*?\n\s*\2\s*(?=\n|$)/g, " $3") // heredoc bodies
+    .replace(/\d?>>?\s*(?:"[^"]*"|'[^']*'|[^\s;|&]+)/g, " "); // redirection targets (writes, 2>&1)
+}
+function tokenize(s) {
+  return (s.match(/"[^"]*"|'[^']*'|\S+/g) || []).map((t) => t.replace(/^["']|["']$/g, ""));
+}
+function num(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+// Returns {start, end} (end may be Infinity) for a reader stage, "edit" for sed -i, null if not a reader.
+function readerRange(cmd, toks, raw) {
+  const flag = (re) => {
+    for (let i = 0; i < toks.length; i++) {
+      const m = re.exec(toks[i]);
+      if (m) return num(m[1] !== undefined && m[1] !== "" ? m[1] : toks[i + 1]);
+    }
+    return null;
+  };
+  if (cmd === "head" || cmd === "tail") {
+    if (toks.some((t) => /^-c/.test(t))) return { start: 1, end: 1 };
+    if (cmd === "tail" && toks.some((t, i) => /^\+\d+$/.test(t) && /^-n$/.test(toks[i - 1] || ""))) return { start: 1, end: Infinity };
+    const n = flag(/^-n(\d*)$/) ?? flag(/^--lines=(\d+)$/) ?? flag(/^-(\d+)$/) ?? 10;
+    return cmd === "head" ? { start: 1, end: n } : { start: null, end: n };
   }
-
-  let payload = {};
-  if (raw.trim()) {
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      payload = {};
+  if (cmd === "sed") {
+    if (toks.some((t) => /^-i/.test(t) || t === "--in-place")) return "edit";
+    if (!toks.includes("-n")) return { start: 1, end: Infinity }; // plain sed prints the whole file
+    const script = toks.find((t) => /^\d+(?:,(?:\d+|\$))?p$/.test(t) || /\$p$/.test(t));
+    if (!script) return { start: 1, end: 1 }; // pattern-only script ~ a search, not a dump
+    const m = /^(\d+)(?:,(\d+|\$))?p$/.exec(script);
+    if (!m) return { start: 1, end: Infinity };
+    const a = num(m[1]);
+    const b = m[2] === undefined ? a : m[2] === "$" ? Infinity : num(m[2]);
+    return { start: a, end: b };
+  }
+  // cat/type/gc/Get-Content/more/less/bat/nl
+  const idx = /\[\s*(\d+)\s*\.\.\s*(\d+)\s*\]/.exec(raw);
+  if (idx) return { start: num(idx[1]) + 1, end: num(idx[2]) + 1 };
+  const head = flag(/^-(?:totalcount|head|first)(?::(\d+))?$/i);
+  if (head !== null) return { start: 1, end: head };
+  const tail = flag(/^-(?:tail|last)(?::(\d+))?$/i);
+  if (tail !== null) return { start: null, end: tail };
+  return { start: 1, end: Infinity };
+}
+function limiterBound(toks) {
+  const c = (toks[0] || "").toLowerCase();
+  if (FILTERS.has(c)) return 0;
+  if (c === "head" || c === "tail") {
+    const r = readerRange(c, toks, "");
+    return r.end;
+  }
+  if (c === "select-object" || c === "select") {
+    for (let i = 0; i < toks.length; i++) {
+      if (/^-(?:first|last)$/i.test(toks[i])) return num(toks[i + 1]) ?? Infinity;
+      if (/^-index$/i.test(toks[i])) return 1;
     }
   }
+  return Infinity;
+}
+// Scans every pipeline; returns {file, norm, start, end, bound} for the first source-file read, else null.
+function findShellReads(cmd) {
+  const hits = [];
+  const cleaned = stripNoise(cmd);
+  for (const seg of cleaned.split(/&&|\|\||;|\r?\n/)) {
+    const stages = seg.split("|").map((s) => s.trim()).filter(Boolean);
+    if (!stages.length) continue;
+    const raw = stages[0];
+    const toks = tokenize(raw.replace(/[()]/g, " ").replace(/\[[^\]]*\]/g, " ")).filter((t) => !/^(?:sudo|&)$/.test(t));
+    while (toks.length && /^\w+=/.test(toks[0])) toks.shift(); // env assignments
+    const c = (toks[0] || "").toLowerCase();
+    if (!READERS.has(c)) continue;
+    const files = toks.slice(1).filter((t) => !t.startsWith("-") && /\.[a-z0-9]{1,6}$/i.test(t));
+    const src = files.map((f) => ({ f, n: normPath(f) })).filter((x) => SOURCE_DIR_RE.test(x.n) && !DOC_RE.test(x.n));
+    if (!src.length) continue;
+    const r = readerRange(c, toks, raw);
+    if (r === "edit") continue;
+    let bound = r.start === null || r.end === Infinity ? r.end : r.end - r.start + 1;
+    for (const st of stages.slice(1)) bound = Math.min(bound, limiterBound(tokenize(st)));
+    for (const x of src) hits.push({ file: x.f, norm: x.n, start: r.start, end: r.end, bound });
+  }
+  return hits;
+}
 
-  const toolName = payload?.toolCall?.name ?? "";
-  const args = payload?.toolCall?.args ?? {};
-  const workspaceRoot = getWorkspaceRoot(payload);
-  const hasGraphifyOut = fs.existsSync(path.join(workspaceRoot, "graphify-out"));
-  const hasGraphifySessionQueried = isSessionQueried(workspaceRoot);
+// ------------------------------------------------------------ SessionStart
+function sessionStart() {
+  if (!hasGraph) pass();
+  emit({
+    hookSpecificOutput: {
+      hookEventName: "SessionStart",
+      additionalContext:
+        "graphify-guard active (graphify-out/ detected):\n" +
+        "1. AST first: Glob/Grep, directory listings and raw source reads are blocked until you run `graphify query \"<1-2 concepts>\" --budget 800`, `graphify explain`, or `graphify path` (use the `graphify` CLI, not `python -m graphify`).\n" +
+        `2. Reads are clamped to ${MAX_WINDOW_LINES} lines; more than ${MAX_CONSECUTIVE_PAGES} consecutive chunk reads of one file are blocked — jump to graphify locations (loc=Lxx) instead.\n` +
+        "3. Run `graphify update .` once at the end of a milestone, not after every edit.",
+    },
+  });
+}
 
-  const BLOCK_MSG =
-    "[HOOK BLOCKED]: Directory scanning and raw file search are strictly disabled when 'graphify-out' exists. Execute a focused 'graphify query', 'explain', or 'path' command FIRST.";
+// --------------------------------------------------------------- PreToolUse
+function preTool() {
+  const tool = String(payload.tool_name || "");
+  const input = payload.tool_input || {};
+  const unlocked = isUnlocked();
 
-  function outputResponse(resp) {
-    process.stdout.write(JSON.stringify(resp));
-    process.exit(0);
+  // Native discovery tools
+  if (tool === "Grep" || tool === "Glob") {
+    if (hasGraph && !unlocked) deny(BLOCK_MSG);
+    pass();
   }
 
-  function blockTool(reason) {
-    process.stderr.write(reason + "\n");
-    process.stdout.write(
-      JSON.stringify({
-        decision: "deny",
-        reason: reason,
-      })
-    );
-    process.exit(1);
-  }
-
-  // -----------------------------------------------------------
-  // GATEKEEPER 0: Native Discovery / Search Tools
-  // -----------------------------------------------------------
-  const nativeDiscoveryTools = new Set([
-    "list_dir",
-    "find_by_name",
-    "grep_search",
-    "glob",
-    "Grep",
-    "Glob",
-    "LS",
-  ]);
-
-  if (nativeDiscoveryTools.has(toolName)) {
-    if (hasGraphifyOut && !hasGraphifySessionQueried) {
-      blockTool(BLOCK_MSG);
-    }
-    outputResponse({ decision: "allow" });
-  }
-
-  // -----------------------------------------------------------
-  // Tool: run_command / Bash / shell
-  // -----------------------------------------------------------
-  if (toolName === "run_command" || toolName === "Bash" || toolName === "shell") {
-    const cmdKey = ["CommandLine", "command", "cmd"].find((k) => k in args) || "CommandLine";
-    const cmd = String(args[cmdKey] ?? "").trim();
-    const lowerCmd = cmd.toLowerCase();
-
-    const isGraphifyLookup = /\bgraphify\b.*?\b(?:query|explain|path)\b/i.test(cmd);
+  // Shell tools
+  if (tool === "Bash" || tool === "PowerShell") {
+    const cmd = String(input.command || "");
+    const isGraphifyLookup = /\bgraphify\b[\s\S]*?\b(?:query|explain|path)\b/i.test(cmd);
     if (isGraphifyLookup) {
-      markSessionQueried(workspaceRoot);
+      unlock();
+      pass();
     }
 
-    if (hasGraphifyOut && !hasGraphifySessionQueried && !isGraphifyLookup) {
-      const isDiscoveryCommand =
-        /\b(?:get-childitem|gci|dir|ls|find|tree|grep|rg|ripgrep|select-string|findstr|test-path)\b/i.test(cmd);
-      if (isDiscoveryCommand) {
-        blockTool(BLOCK_MSG);
+    if (hasGraph && !unlocked) {
+      const isDiscovery =
+        /\b(?:get-childitem|gci|dir|ls|find|tree|grep|rg|ripgrep|select-string|findstr)\b/i.test(cmd);
+      if (isDiscovery) deny(BLOCK_MSG);
+    }
+
+    // Shell file reads of source files: same rules as Read (lock, 300-line window, paging ban)
+    if (hasGraph) {
+      for (const h of findShellReads(cmd)) {
+        if (!unlocked) deny(BLOCK_MSG);
+        if (h.bound > MAX_WINDOW_LINES) {
+          deny(
+            `[graphify-guard] Shell read of '${h.file}' would print ${h.bound === Infinity ? "the whole file" : h.bound + " lines"}. ` +
+              `Use Read with offset/limit (max ${MAX_WINDOW_LINES} lines), or \`graphify explain "<symbol>"\` to jump to loc=Lxx.`
+          );
+        }
+        if (h.start !== null && h.end !== Infinity) {
+          const count = trackPaging(h.norm, h.start, h.end);
+          if (count > MAX_CONSECUTIVE_PAGES) deny(pagingMsg(h.norm, count));
+        }
       }
     }
 
-    const isGitGrep = /\bgit\s+grep\b/i.test(cmd);
-    if (isGitGrep) {
-      outputResponse({ decision: "allow" });
-    }
-
-    const isGrep = /\bgrep\b/i.test(cmd);
-    const isRipgrep = /\b(rg|ripgrep)\b/i.test(cmd);
-    const isFindstr = /\bfindstr\b/i.test(cmd);
-    const isSelectString =
-      /\bselect-string\b/i.test(cmd) &&
-      (/-path\b/i.test(cmd) || /\bget-childitem\b/i.test(cmd));
-
-    const isSearchCommand = isGrep || isRipgrep || isFindstr || isSelectString;
-
-    // Allow scoped package searches (e.g. node_modules/three/...), block root node_modules dumps
-    const isUnscopedNodeModules =
-      /(?:^|[\s"'/\\])node_modules(?:\/?\s*$|\/?\s+|\/?\*+|["'])/i.test(cmd);
-
-    if (isSearchCommand && isUnscopedNodeModules && !lowerCmd.includes("--force-vendor")) {
-      blockTool(
-        "BLOCKED by context-guard: Unscoped search in root node_modules prohibited. Target a specific package (node_modules/<pkg>) or pass --force-vendor."
+    const isSearch =
+      /\b(?:grep|rg|ripgrep|findstr)\b/i.test(cmd) && !/\bgit\s+grep\b/i.test(cmd) ||
+      (/\bselect-string\b/i.test(cmd) && /(-path\b|\bget-childitem\b)/i.test(cmd));
+    const unscopedNodeModules = /(?:^|[\s"'/\\])node_modules(?:[\/\\]?\s*$|[\/\\]?\s+|[\/\\]?\*+|["'])/i.test(cmd);
+    if (isSearch && unscopedNodeModules && !/--force-vendor/i.test(cmd)) {
+      deny(
+        "[graphify-guard] Unscoped search in root node_modules is prohibited. Target node_modules/<pkg>/... or pass --force-vendor."
       );
     }
-
-    if (isGrep && !cmd.includes("--exclude-dir") && !lowerCmd.includes("node_modules")) {
-      const rewritten = cmd.replace(
-        /\bgrep\b/i,
-        "grep --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=.git"
-      );
-      outputResponse({
-        decision: "allow",
-        overwrite: { [cmdKey]: rewritten },
-      });
-    }
-
-    outputResponse({ decision: "allow" });
+    pass();
   }
 
-  // -----------------------------------------------------------
-  // Tool: read_file / Read / view_file
-  // -----------------------------------------------------------
-  if (toolName === "read_file" || toolName === "Read" || toolName === "view_file") {
-    const rawPath = String(args.Path ?? args.file_path ?? args.path ?? "");
-    const resolvedPath = path.isAbsolute(rawPath)
-      ? rawPath
-      : path.resolve(workspaceRoot, rawPath);
-    const normalizedPath = resolvedPath.replace(/\\/g, "/").toLowerCase();
+  // Read
+  if (tool === "Read") {
+    if (!hasGraph) pass(); // all read rules are graph-project only
 
-    // Turn-1 AST Control
-    if (hasGraphifyOut && !hasGraphifySessionQueried) {
-      const isAllowedDoc =
-        /(?:roadmap\.md|readme\.md|gemini\.md|agents\.md|claude\.md|package\.json|tsconfig.*\.json)$/i.test(
-          normalizedPath
-        );
-      const isSourcePath =
-        normalizedPath.includes("/src/") ||
-        normalizedPath.includes("/lib/") ||
-        normalizedPath.includes("/app/") ||
-        normalizedPath.includes("/tools/") ||
-        normalizedPath.includes("/public/");
+    const rawPath = String(input.file_path || "");
+    if (!rawPath) pass();
+    const abs = path.isAbsolute(rawPath) ? rawPath : path.resolve(workspaceRoot, rawPath);
+    const norm = abs.replace(/\\/g, "/").toLowerCase();
 
-      if (!isAllowedDoc && isSourcePath) {
-        blockTool(BLOCK_MSG);
-      }
+    // Binary / rich files are rendered differently by Read — never clamp them
+    if (/\.(png|jpe?g|gif|webp|bmp|svg|pdf|ipynb)$/i.test(norm)) pass();
+
+    const isDoc =
+      /(?:roadmap\.md|readme\.md|claude\.md|agents\.md|gemini\.md|package\.json|tsconfig[^/]*\.json)$/i.test(norm);
+    if (isDoc) pass();
+
+    if (!unlocked) {
+      const isSource = /\/(?:src|lib|app|tools|public)\//.test(norm);
+      if (isSource) deny(BLOCK_MSG);
     }
 
-    // Normalize line slice parameters across different host schemas
-    const startKey =
-      ["StartLine", "start_line", "offset", "line_offset"].find((k) => k in args) || "start_line";
-    const endKey =
-      ["EndLine", "end_line", "limit", "line_count"].find((k) => k in args) || "end_line";
-    const isCountBased = endKey === "limit" || endKey === "line_count";
+    const start = Number.isInteger(input.offset) && input.offset > 0 ? input.offset : 1;
+    const requested = Number.isInteger(input.limit) && input.limit > 0 ? input.limit : null;
+    const count = requested === null ? MAX_WINDOW_LINES : Math.min(requested, MAX_WINDOW_LINES);
+    const end = start + count - 1;
 
-    const start = typeof args[startKey] === "number" && args[startKey] > 0 ? args[startKey] : 1;
-    let end = null;
+    // Sequential paging tracker (shared with shell ranged reads)
+    const pages = trackPaging(norm, start, end);
+    if (pages > MAX_CONSECUTIVE_PAGES) deny(pagingMsg(norm, pages));
 
-    if (typeof args[endKey] === "number" && args[endKey] > 0) {
-      end = isCountBased ? start + args[endKey] - 1 : args[endKey];
-    }
-
-    const needsUnboundedClamp = end === null;
-    if (needsUnboundedClamp) {
-      end = start + MAX_WINDOW_LINES - 1;
-    }
-
-    const requestedWindow = end - start + 1;
-
-    // --- SEQUENTIAL PAGING / READ TRACKER CONTROL ---
-    const history = getReadHistory(workspaceRoot);
-    const now = Date.now();
-    const fileRecord = history[normalizedPath] || { count: 0, lastEnd: 0, timestamp: 0 };
-
-    const isWithinTtl = now - fileRecord.timestamp < PAGING_TTL_MS;
-    const isSequentialContinuation = isWithinTtl && Math.abs(start - (fileRecord.lastEnd + 1)) <= 5;
-
-    if (isSequentialContinuation) {
-      fileRecord.count += 1;
-    } else {
-      fileRecord.count = 1;
-    }
-    fileRecord.lastEnd = Math.min(end, start + MAX_WINDOW_LINES - 1);
-    fileRecord.timestamp = now;
-
-    if (fileRecord.count > MAX_CONSECUTIVE_PAGES) {
-      saveReadHistory(workspaceRoot, history);
-      blockTool(
-        `[BLOCKED by context-guard]: Sequential paging detected on '${path.basename(normalizedPath)}' ` +
-          `(${fileRecord.count} consecutive reads). Do not drain context by reading entire files in chunks.\n` +
-          `Action: Use Graphify to locate the exact symbol line (loc=Lxx), then read strictly 30-50 lines around it.`
-      );
-    }
-
-    history[normalizedPath] = fileRecord;
-    saveReadHistory(workspaceRoot, history);
-
-    // --- SLICE CLAMPING ---
-    if (needsUnboundedClamp || requestedWindow > MAX_WINDOW_LINES) {
-      const clampedEnd = start + MAX_WINDOW_LINES - 1;
-      outputResponse({
-        decision: "allow",
-        overwrite: {
-          [startKey]: start,
-          [endKey]: isCountBased ? MAX_WINDOW_LINES : clampedEnd,
+    if (requested === null || requested > MAX_WINDOW_LINES) {
+      emit({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          permissionDecisionReason: `graphify-guard clamped Read to lines ${start}-${end} (max ${MAX_WINDOW_LINES}). Request further ranges explicitly if needed.`,
+          updatedInput: { ...input, offset: start, limit: MAX_WINDOW_LINES },
         },
       });
     }
-
-    outputResponse({ decision: "allow" });
+    pass();
   }
 
-  outputResponse({ decision: "allow" });
+  pass();
 }
+
+// dispatch last: helpers above are const arrow functions (TDZ)
+if (mode === "session-start") sessionStart();
+else preTool();
