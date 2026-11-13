@@ -134,31 +134,23 @@ Because the key includes `session_id`, parallel Claude Code sessions in the same
 
 Requirements: Claude Code, Node.js ≥ 18 on PATH, and the [Graphify](https://github.com/safishamsi/graphify) CLI (`uv tool install graphifyy`) with a `graphify-out/` built in your project.
 
-### Option A: try it for one session
+### Option A: install from GitHub (recommended)
+
+The repo is also a single-plugin marketplace (`.claude-plugin/marketplace.json`). In Claude Code, run:
+
+```text
+/plugin marketplace add ilovecofee00/graphify-context-guard
+/plugin install graphify-guard@graphify-context-guard
+```
+
+Restart Claude Code (or run `/reload-plugins`) to load the hooks. To get updates later, run `/plugin marketplace update graphify-context-guard`. To pin a release instead of following `main`, add the tag, for example `/plugin marketplace add ilovecofee00/graphify-context-guard#v1.0.1`.
+
+### Option B: try it for one session without installing
 
 ```bash
 git clone https://github.com/ilovecofee00/graphify-context-guard.git
 claude --plugin-dir ./graphify-context-guard
 ```
-
-### Option B: install permanently via a local marketplace
-
-1. Make a marketplace folder (for example `~/.claude/local-plugins/`) and clone this repo into it as `graphify-guard/`.
-2. Create `~/.claude/local-plugins/.claude-plugin/marketplace.json`:
-   ```json
-   {
-     "name": "my-local",
-     "owner": { "name": "you" },
-     "plugins": [
-       { "name": "graphify-guard", "source": "./graphify-guard" }
-     ]
-   }
-   ```
-3. In Claude Code:
-   ```text
-   /plugin marketplace add ~/.claude/local-plugins
-   /plugin install graphify-guard@my-local
-   ```
 
 ### Optional: model-facing rules
 
@@ -206,7 +198,8 @@ npm test
 ```text
 .
 ├── .claude-plugin/
-│   └── plugin.json            # Claude Code plugin manifest
+│   ├── plugin.json            # Claude Code plugin manifest
+│   └── marketplace.json       # Makes the repo installable via /plugin marketplace add
 ├── hooks/
 │   └── hooks.json             # SessionStart + PreToolUse (Bash|PowerShell|Read|Grep|Glob)
 ├── scripts/

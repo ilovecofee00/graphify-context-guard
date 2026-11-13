@@ -1,6 +1,6 @@
 {
   "name": "graphify-context-guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Claude Code plugin hooks enforcing Graphify-first exploration, a 300-line Read clamp, sequential-paging protection and unscoped node_modules search prevention.",
   "main": "scripts/context-guard.cjs",
   "scripts": {

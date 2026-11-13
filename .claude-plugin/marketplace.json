@@ -1,0 +1,12 @@
+{
+  "name": "graphify-context-guard",
+  "owner": { "name": "Kemal Arda Aytaç" },
+  "description": "Single-plugin marketplace for graphify-guard, a Claude Code plugin that keeps exploration Graphify-first and context-efficient.",
+  "plugins": [
+    {
+      "name": "graphify-guard",
+      "source": "./",
+      "description": "Graphify-first exploration gate, 300-line Read clamp, sequential-paging ban and node_modules search guard for Claude Code."
+    }
+  ]
+}
